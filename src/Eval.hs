@@ -3,12 +3,17 @@ module Eval where
 
 import Core
 import Util
+import Control.Monad
 import qualified Data.Map as M
+import qualified Data.Set as S
+import Text.Printf
 import Data.List
 import Data.Functor
 import Data.Bifunctor
 
+
 newtype Config = C C
+    deriving (Eq, Ord)
 
 instance Show Config where
     show (C (vea, env, store, a, t)) = "(" ++ internal ++ ")"
@@ -28,51 +33,68 @@ instance Show Addr where
     show (Addr i) = show i
 
 newtype Env = Env (M.Map String Addr)
+    deriving (Eq, Ord)
 
 instance Show Env where
     show (Env e) = show $ M.toList e
 
-newtype Store = Store (M.Map Addr (Either Value Kont))
+newtype Store = Store (M.Map Addr (S.Set (Either Value Kont)))
+    deriving (Eq, Ord)
 
 instance Show Store where
     show (Store s) = "[" ++ internal ++ "]"
         where
             internal = intercalate "," $ showEntry <$> lst
-            showEntry (a, e) = show a ++ " -> " ++ showEither e
+            showEntry (a,s) = printf "(%s -> { %s })" (show a) (showSet s)
+            showSet s = intercalate "," $ showEither <$> S.toList s
             lst = M.toList s
 
-derefV :: String -> Env -> Store -> Either Error Value
-derefV x (Env p) (Store s) = case (`M.lookup` s)  <$> M.lookup x p of
+derefV :: String -> Env -> Store -> Either Error (S.Set (Either Error Value))
+derefV x (Env p) (Store s) = 
+    case (`M.lookup` s)  <$> M.lookup x p of
     Nothing -> Left $ UnboundVar x
     Just Nothing -> Left IllegalAddress
-    Just (Just (Right _)) -> Left NonValue
-    Just (Just (Left v)) -> return v
-    
+    Just (Just eOrVs) -> Right $ checkV <%> eOrVs
+    where
+        checkV (Left v) = Right v
+        checkV (Right _) = Left NonValue
 
-derefK :: Addr -> Store -> Either Error Kont
+
+derefK :: Addr -> Store -> Either Error (S.Set (Either Error Kont))
 derefK a (Store s) = 
     case M.lookup a s of
         Nothing -> Left IllegalAddress
-        Just (Left _) -> Left $ NonContinuation a
-        Just (Right k) -> Right k
+        Just eOrVs -> Right $ checkK <%> eOrVs
+        where
+            checkK (Left v) = Left $ NonContinuation a
+            checkK (Right k) = Right k
 
 alloc :: C -> Addr
 alloc (_,_,_,_,T t) = Addr t
 
+update :: Addr -> Either Value Kont -> Store -> Store
+update k v (Store s) = Store s'
+    where
+        s' = M.alter f k s
+        set = S.singleton v
+        f Nothing = Just set
+        f (Just s) = Just $ s `S.union` set
+
+
 allocK :: Kont -> C -> (Addr, Store)
-allocK k c@(_,_,Store s,_,_) = (a, Store $ M.insert a (Right k) s)
+allocK k c@(_,_,store,_,_) = (a, update a (Right k) store)
     where
         a = alloc c
 
 allocV :: String -> Value -> Env -> C -> (Env, Store)
-allocV x v (Env p) c@(_,_,Store s,_,_) = (Env p', Store s')
+allocV x v (Env p) c@(_,_,store,_,_) = (Env p', s')
     where
         p' = M.insert x a p
-        s' = M.insert a (Left v) s
+        s' = update a (Left v) store
         a = alloc c
 
 newtype Time = T Integer
-    deriving Show
+    deriving (Show, Eq, Ord)
 
 tick :: C -> Time
 tick (_,_,_,_,T i) = T $ i + 1
@@ -82,7 +104,7 @@ data Value
     = VI Int
     | VB Bool
     | Closure String Exp 
-    deriving Show
+    deriving (Show, Eq, Ord)
 
 typeof :: Value -> Type
 typeof VI {} = Number
@@ -92,11 +114,14 @@ typeof Closure {} = Function
 typeError :: Type -> Value -> Either Error a
 typeError t v = Left $ TypeError (t, typeof v)
 
+lTypeError :: forall a. Type -> Value -> S.Set (Either Error a)
+lTypeError t v = S.singleton $ typeError t v
+
 data Type
     = Number
     | Boolean
     | Function
-    deriving Show
+    deriving (Show, Eq, Ord)
 
 data Kont
     = Ar Exp Env Addr
@@ -106,7 +131,7 @@ data Kont
     | Op2_a Op Exp Env Addr
     | Op2_b Op Int Env Addr
     | RecBind String Addr
-    deriving Show
+    deriving (Show, Eq, Ord)
 
 data Error
     = UnboundVar String
@@ -115,67 +140,81 @@ data Error
     | NonContinuation Addr
     | DivByZero
     | TypeError (Type, Type)
-    deriving Show
+    deriving (Show, Eq, Ord)
 
 inject :: Exp -> C
 inject e = (Right e, Env M.empty, s, Addr 0, tInit)
     where
-        s = Store $ M.insert (Addr 0) (Right Mt) M.empty
+        s = update (Addr 0) (Right Mt) (Store M.empty)
 
 tInit = T 1
 
-run :: C -> Maybe Time -> ([C], Maybe Error)
-run c t = do
-    case eval c of
-        Left e -> ([c], Just e)
-        Right c' -> case done c' t of
-            Left e -> ([c,c'], Just e)
-            Right True -> ([c,c'], Nothing)
-            Right False -> 
-                let (cs, me) = run c' t in 
-                (c:cs, me)
+run :: C -> M.Map C (S.Set (Either Error C))
+run c = runner (S.singleton c) M.empty
+
     
-    
+runner :: S.Set C -> M.Map C (S.Set (Either Error C)) -> M.Map C (S.Set (Either Error C))
+runner worklist graph
+    | S.null worklist = graph
+    | otherwise = 
+        let (c, worklist') = S.deleteFindMin worklist in
+        let next = eval c in
+        let graph' = M.insert c next graph in
+        let worklist'' = S.delete c (gatherRights next `S.union` worklist') in
+        runner worklist'' graph'
 
-done :: C -> Maybe Time -> Either Error Bool
-done (Left v, _, s, a, t) m = do 
-    k <- derefK a s
-    return $ isMt k || hitBound t m
-done (_,_,_,_,t) m = return $ hitBound t m
 
-hitBound :: Time -> Maybe Time -> Bool
-hitBound t Nothing = False
-hitBound (T t) (Just (T t')) = t == t'
 
-isMt :: Kont -> Bool
-isMt Mt = True
-isMt _ = False
 
-eval :: C -> Either Error C
-eval c@(Left v, env, s, a, t) = derefK a s >>= evalValue c v 
+pullValid :: forall e a b. (Ord e) => (Ord b) => S.Set (Either e a) -> (a -> S.Set (Either e b)) -> S.Set (Either e b)
+pullValid rs f = S.unions (extract <%> rs)
+    where
+        extract :: Either e a -> S.Set (Either e b)
+        extract (Left e) = S.singleton (Left e)
+        extract (Right v) = f v
+
+eval :: C -> S.Set (Either Error C)
+eval c@(Left v, env, s, a, t) =
+    case derefK a s of
+        Left e -> S.singleton (Left e)
+        Right rs -> pullValid rs (S.singleton . evalValue c v)
 eval c@(Right e, env, s, a, t) = evalExpr c e 
 
-evalExpr :: C -> Exp -> Either Error C
-evalExpr c@(_, p, s, a, t) (Num i) = return $ putV c $ VI i
-evalExpr c@(_, p, s, a, t) (Bool b) = return $ putV c $ VB b
-evalExpr c@(_, p, s, a, t) (x :-> v) = return $ putV c $ Closure x v
-evalExpr c@(_, p, s, a, t) (Var x) = putV c <$> derefV x p s 
+lreturn :: forall a b. a -> S.Set (Either b a)
+lreturn a = S.singleton $ return a
+
+-- derefV :: String -> Env -> Store -> Either Error (S.Set (Either Error Value))
+
+-- TODO: rename lol
+handle :: forall a b. (Ord b) => Either Error (S.Set (Either Error a)) -> (a -> b) -> S.Set (Either Error b)
+handle (Left e) f  = S.singleton $ Left e
+handle (Right es) f = g <%> es
+    where
+        g (Left e) = Left e
+        g (Right v) = Right $ f v
+        
+
+evalExpr :: C -> Exp -> S.Set (Either Error C)
+evalExpr c@(_, p, s, a, t) (Num i) = lreturn $ putV c $ VI i
+evalExpr c@(_, p, s, a, t) (Bool b) = lreturn $ putV c $ VB b
+evalExpr c@(_, p, s, a, t) (x :-> v) = lreturn $ putV c $ Closure x v
+evalExpr c@(_, p, s, a, t) (Var x) = handle (derefV x p s) (putV c)
 evalExpr c@(_, p, s, a, t) (Op2 o e1 e2) = do
     let k = Op2_a o e2 p a
     let (a',s') = allocK k c
-    return (Right e1, p, s', a', tick c)
+    lreturn (Right e1, p, s', a', tick c)
 evalExpr c@(_, p, s, a, t) (If e0 e1 e2) = do
     let k = IfK e1 e2 p a
     let (a', s') = allocK k c
-    return (Right e0, p, s', a', tick c)
+    lreturn (Right e0, p, s', a', tick c)
 evalExpr c@(_, p, s, a, t) (e0 :@ e1) = do
     let k = Ar e1 p a
     let (a',s') = allocK k c
-    return (Right e0, p, s', a', tick c)
+    lreturn (Right e0, p, s', a', tick c)
 evalExpr c@(_, p, s, a, t) (Rec name body) = do
     let k = RecBind name a
     let (a',s') = allocK k c
-    return (Right body, p, s', a', tick c)
+    lreturn (Right body, p, s', a', tick c)
     
 
 putV :: C -> Value -> C

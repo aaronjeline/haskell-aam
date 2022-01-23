@@ -9,8 +9,8 @@ data Exp
     | Op2 Op Exp Exp 
     | If Exp Exp Exp
     | Exp :@ Exp
-    deriving (Show, Eq)
+    deriving (Show, Eq, Ord)
 
 
 data Op = Add | Sub | Div | Mult | Eq
-    deriving (Show, Eq)
+    deriving (Show, Eq, Ord)

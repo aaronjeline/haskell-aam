@@ -3,16 +3,22 @@ module Toplevel where
 import Data.Bifunctor
 import Data.Maybe
 import Control.Monad
+import qualified Data.Map as M
+import qualified Data.Set as S
 
 import Lang
 import Desugar
+import Analysis
 import qualified Core as C
 import qualified Eval as E
 
 
-run :: Exp -> Maybe Integer -> ([E.Config], Maybe E.Error)
-run e b = let e' = desugar e in let c = E.inject e' in first (map E.C) (E.run c t)
-    where t = E.T <$> b
+run :: Exp -> (E.Config, Graph)
+run e = 
+    let e' = desugar e in 
+    let c = E.inject e' in 
+    let m = E.run c in
+    (E.C c, makeExternal m)
 
 value :: [E.Config] -> E.Value
 value cs = case last cs of
@@ -46,12 +52,10 @@ target = fact5
 go :: IO ()
 go = do
     print "Running..."
-    let (cs, e) = run target Nothing
-    print e
-    forM_ cs print
-    when (isNothing e) $ do
-        putStrLn "Final Value: "
-        print $ value cs
+    let (c,g) = run target
+    putStrLn "Done"
+    let vs = allReachableHalts g c
+    print vs
 
 
 
