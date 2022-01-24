@@ -3,6 +3,7 @@ module Toplevel where
 import Data.Bifunctor
 import Data.Maybe
 import Control.Monad
+import LabelCheck
 import qualified Data.Map as M
 import qualified Data.Set as S
 
@@ -15,7 +16,7 @@ import qualified Eval as E
 
 run :: Exp -> (E.Config, Graph)
 run e = 
-    let e' = desugar e in 
+    let e' = desugarLang e in 
     let c = E.inject e' in 
     let m = E.run c in
     (E.C c, makeExternal m)
@@ -23,6 +24,7 @@ run e =
 value :: [E.Config] -> E.Value
 value cs = case last cs of
     E.C (Left v,_,_,_,_) -> v
+    _ -> error "Stop"
 
 ex0 :: Exp
 ex0 = Num 1

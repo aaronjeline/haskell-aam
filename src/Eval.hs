@@ -11,6 +11,7 @@ import Data.List
 import Data.Functor
 import Data.Bifunctor
 
+type Contour = [String]
 
 newtype Config = C C
     deriving (Eq, Ord)
@@ -28,6 +29,9 @@ type C = (Either Value Exp, Env, Store, Addr, Time)
 
 newtype Addr = Addr Integer
     deriving (Eq, Ord)
+
+newtype Time = T Integer
+    deriving (Show, Eq, Ord)
 
 instance Show Addr where
     show (Addr i) = show i
@@ -93,8 +97,6 @@ allocV x v (Env p) c@(_,_,store,_,_) = (Env p', s')
         s' = update a (Left v) store
         a = alloc c
 
-newtype Time = T Integer
-    deriving (Show, Eq, Ord)
 
 tick :: C -> Time
 tick (_,_,_,_,T i) = T $ i + 1
@@ -195,23 +197,23 @@ handle (Right es) f = g <%> es
         
 
 evalExpr :: C -> Exp -> S.Set (Either Error C)
-evalExpr c@(_, p, s, a, t) (Num i) = lreturn $ putV c $ VI i
-evalExpr c@(_, p, s, a, t) (Bool b) = lreturn $ putV c $ VB b
-evalExpr c@(_, p, s, a, t) (x :-> v) = lreturn $ putV c $ Closure x v
-evalExpr c@(_, p, s, a, t) (Var x) = handle (derefV x p s) (putV c)
-evalExpr c@(_, p, s, a, t) (Op2 o e1 e2) = do
+evalExpr c@(_, p, s, a, t) (Num l i) = lreturn $ putV c $ VI i
+evalExpr c@(_, p, s, a, t) (Bool l b) = lreturn $ putV c $ VB b
+evalExpr c@(_, p, s, a, t) (Abs l x v) = lreturn $ putV c $ Closure x v
+evalExpr c@(_, p, s, a, t) (Var l x) = handle (derefV x p s) (putV c)
+evalExpr c@(_, p, s, a, t) (Op2 l o e1 e2) = do
     let k = Op2_a o e2 p a
     let (a',s') = allocK k c
     lreturn (Right e1, p, s', a', tick c)
-evalExpr c@(_, p, s, a, t) (If e0 e1 e2) = do
+evalExpr c@(_, p, s, a, t) (If l e0 e1 e2) = do
     let k = IfK e1 e2 p a
     let (a', s') = allocK k c
     lreturn (Right e0, p, s', a', tick c)
-evalExpr c@(_, p, s, a, t) (e0 :@ e1) = do
+evalExpr c@(_, p, s, a, t) (App l e0 e1) = do
     let k = Ar e1 p a
     let (a',s') = allocK k c
     lreturn (Right e0, p, s', a', tick c)
-evalExpr c@(_, p, s, a, t) (Rec name body) = do
+evalExpr c@(_, p, s, a, t) (Rec l name body) = do
     let k = RecBind name a
     let (a',s') = allocK k c
     lreturn (Right body, p, s', a', tick c)

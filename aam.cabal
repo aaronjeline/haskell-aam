@@ -29,6 +29,8 @@ library
       Core
       Desugar
       Eval
+      Graphing
+      LabelCheck
       Lang
       Lib
       Toplevel
