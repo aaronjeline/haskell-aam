@@ -44,7 +44,7 @@ isHalted :: Config -> Maybe Value
 isHalted (C (Left v,p,s,a,t)) = 
     case derefK a s of
         Left _ -> Nothing
-        Right s -> if contains s isMt then Just v else Nothing
+        Right s -> if any isMt s then Just v else Nothing
 isHalted (C (Right _,p,s,a,t)) = Nothing
 
 isMt :: Either Error Kont -> Bool

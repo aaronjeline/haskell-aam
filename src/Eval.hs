@@ -27,10 +27,10 @@ instance Show Config where
 
 type C = (Either Value Exp, Env, Store, Addr, Time)
 
-newtype Addr = Addr Integer
+newtype Addr = Addr Integer -- (Either Label String, Contour)
     deriving (Eq, Ord)
 
-newtype Time = T Integer
+newtype Time = T Integer -- (Maybe Label, Contour)
     deriving (Show, Eq, Ord)
 
 instance Show Addr where
@@ -53,28 +53,31 @@ instance Show Store where
             showSet s = intercalate "," $ showEither <$> S.toList s
             lst = M.toList s
 
-derefV :: String -> Env -> Store -> Either Error (S.Set (Either Error Value))
+derefV :: String -> Env -> Store -> Either Error [Either Error Value]
 derefV x (Env p) (Store s) = 
     case (`M.lookup` s)  <$> M.lookup x p of
     Nothing -> Left $ UnboundVar x
     Just Nothing -> Left IllegalAddress
-    Just (Just eOrVs) -> Right $ checkV <%> eOrVs
+    Just (Just eOrVs) -> Right $ checkV <$> S.toList eOrVs
     where
         checkV (Left v) = Right v
         checkV (Right _) = Left NonValue
 
 
-derefK :: Addr -> Store -> Either Error (S.Set (Either Error Kont))
+derefK :: Addr -> Store -> Either Error [Either Error Kont]
 derefK a (Store s) = 
     case M.lookup a s of
         Nothing -> Left IllegalAddress
-        Just eOrVs -> Right $ checkK <%> eOrVs
+        Just eOrVs -> Right $ checkK <$> S.toList eOrVs
         where
             checkK (Left v) = Left $ NonContinuation a
             checkK (Right k) = Right k
+            
+tick :: C -> [Time]
+tick (_,_,_,_,T i) = [T $ i + 1]
 
-alloc :: C -> Addr
-alloc (_,_,_,_,T t) = Addr t
+alloc :: C -> [Addr]
+alloc (_,_,_,_,T t) = [Addr t]
 
 update :: Addr -> Either Value Kont -> Store -> Store
 update k v (Store s) = Store s'
@@ -85,21 +88,19 @@ update k v (Store s) = Store s'
         f (Just s) = Just $ s `S.union` set
 
 
-allocK :: Kont -> C -> (Addr, Store)
-allocK k c@(_,_,store,_,_) = (a, update a (Right k) store)
+allocK :: Kont -> C -> [(Addr, Store)]
+allocK k c@(_,_,store,_,_) = (\a -> (a, update a (Right k) store)) <$> as
     where
-        a = alloc c
+        as = alloc c
 
-allocV :: String -> Value -> Env -> C -> (Env, Store)
-allocV x v (Env p) c@(_,_,store,_,_) = (Env p', s')
+allocV :: String -> Value -> Env -> C -> [(Env, Store)]
+allocV x v (Env p) c@(_,_,store,_,_) = (\(s', p') -> (Env p', s')) <$> zip ss' ps'
     where
-        p' = M.insert x a p
-        s' = update a (Left v) store
-        a = alloc c
+        ps' = (\a -> M.insert x a p) <$> as
+        ss' = (\a -> update a (Left v) store) <$> as
+        as = alloc c
 
 
-tick :: C -> Time
-tick (_,_,_,_,T i) = T $ i + 1
 
 
 data Value 
@@ -116,8 +117,8 @@ typeof Closure {} = Function
 typeError :: Type -> Value -> Either Error a
 typeError t v = Left $ TypeError (t, typeof v)
 
-lTypeError :: forall a. Type -> Value -> S.Set (Either Error a)
-lTypeError t v = S.singleton $ typeError t v
+lTypeError :: forall a. Type -> Value -> [Either Error a]
+lTypeError t v = [typeError t v]
 
 data Type
     = Number
@@ -149,6 +150,7 @@ inject e = (Right e, Env M.empty, s, Addr 0, tInit)
     where
         s = update (Addr 0) (Right Mt) (Store M.empty)
 
+tInit :: Time
 tInit = T 1
 
 run :: C -> M.Map C (S.Set (Either Error C))
@@ -160,7 +162,7 @@ runner worklist graph
     | S.null worklist = graph
     | otherwise = 
         let (c, worklist') = S.deleteFindMin worklist in
-        let next = eval c in
+        let next = S.fromList $ eval c in
         let graph' = M.insert c next graph in
         let worklist'' = S.delete c (gatherRights next `S.union` worklist') in
         runner worklist'' graph'
@@ -175,55 +177,58 @@ pullValid rs f = S.unions (extract <%> rs)
         extract (Left e) = S.singleton (Left e)
         extract (Right v) = f v
 
-eval :: C -> S.Set (Either Error C)
-eval c@(Left v, env, s, a, t) =
+eval :: C -> [Either Error C]
+eval c@(Left v, env, s, a, t) = do
     case derefK a s of
-        Left e -> S.singleton (Left e)
-        Right rs -> pullValid rs (S.singleton . evalValue c v)
+        Left e -> return $ Left e
+        Right ks -> ks >>= \mk -> do
+            case mk of
+                Left e -> return $ Left e
+                Right k -> evalValue c v k
 eval c@(Right e, env, s, a, t) = evalExpr c e 
 
-lreturn :: forall a b. a -> S.Set (Either b a)
-lreturn a = S.singleton $ return a
+lreturn :: forall a b. a -> [Either b a]
+lreturn a = [return a]
 
 -- derefV :: String -> Env -> Store -> Either Error (S.Set (Either Error Value))
 
 -- TODO: rename lol
-handle :: forall a b. (Ord b) => Either Error (S.Set (Either Error a)) -> (a -> b) -> S.Set (Either Error b)
-handle (Left e) f  = S.singleton $ Left e
-handle (Right es) f = g <%> es
-    where
-        g (Left e) = Left e
-        g (Right v) = Right $ f v
+handle :: forall a b. Either Error [Either Error a] -> (a -> [Either Error b]) -> [Either Error b]
+handle (Left e) f  = [Left e]
+handle (Right as) f = do
+    ma <- as
+    case ma of
+        Left e -> [Left e]
+        Right a -> f a
+
+
+
         
 
-evalExpr :: C -> Exp -> S.Set (Either Error C)
-evalExpr c@(_, p, s, a, t) (Num l i) = lreturn $ putV c $ VI i
-evalExpr c@(_, p, s, a, t) (Bool l b) = lreturn $ putV c $ VB b
-evalExpr c@(_, p, s, a, t) (Abs l x v) = lreturn $ putV c $ Closure x v
+-- TODO: Some refactoring can happen here
+evalExpr :: C -> Exp -> [Either Error C]
+evalExpr c@(_, p, s, a, t) (Num l i) = putV c $ VI i
+evalExpr c@(_, p, s, a, t) (Bool l b) = putV c $ VB b
+evalExpr c@(_, p, s, a, t) (Abs l x v) = putV c $ Closure x v
 evalExpr c@(_, p, s, a, t) (Var l x) = handle (derefV x p s) (putV c)
-evalExpr c@(_, p, s, a, t) (Op2 l o e1 e2) = do
-    let k = Op2_a o e2 p a
-    let (a',s') = allocK k c
-    lreturn (Right e1, p, s', a', tick c)
-evalExpr c@(_, p, s, a, t) (If l e0 e1 e2) = do
-    let k = IfK e1 e2 p a
-    let (a', s') = allocK k c
-    lreturn (Right e0, p, s', a', tick c)
-evalExpr c@(_, p, s, a, t) (App l e0 e1) = do
-    let k = Ar e1 p a
-    let (a',s') = allocK k c
-    lreturn (Right e0, p, s', a', tick c)
-evalExpr c@(_, p, s, a, t) (Rec l name body) = do
-    let k = RecBind name a
-    let (a',s') = allocK k c
-    lreturn (Right body, p, s', a', tick c)
+evalExpr c@(_, p, s, a, t) (Op2 l o e1 e2) = exprHandler c (Op2_a o e2 p a) e1
+evalExpr c@(_, p, s, a, t) (If l e0 e1 e2) = exprHandler c (IfK e1 e2 p a) e0
+evalExpr c@(_, p, s, a, t) (App l e0 e1) = exprHandler c (Ar e1 p a) e0
+evalExpr c@(_, p, s, a, t) (Rec l name body) = exprHandler c (RecBind name a) body
     
+exprHandler c@(_,p,_,_,_) k e = do
+    (a', s') <- allocK k c
+    t' <- tick c
+    lreturn (Right e, p, s', a', t')
 
-putV :: C -> Value -> C
-putV c@(_, p, s, a, t) v = (Left v, p, s, a, tick c)
 
-evalValue :: C -> Value -> Kont -> Either Error C
-evalValue c v Mt  = return c
+putV :: C -> Value -> [Either Error C]
+putV c@(_, p, s, a, t) v = do
+    t' <- tick c
+    return $ Right (Left v, p, s, a, t')
+
+evalValue :: C -> Value -> Kont -> [Either Error C]
+evalValue c v Mt  = lreturn c
 evalValue c v (Ar e p' a')  = evalAr c v e p' a'
 evalValue c v (Fn cls p' a) = evalFn c v cls p' a
 evalValue c v (IfK e0 e1 p a) = evalIf c v e0 e1 p a
@@ -231,49 +236,59 @@ evalValue c v (Op2_a o e p a) = evalOp2A c v o e p a
 evalValue c v (Op2_b o n p a) = evalOp2B c v o n p a
 evalValue c v (RecBind n a) = evalRecBind c v n a
 
-evalAr :: C -> Value -> Exp -> Env -> Addr -> Either Error C 
+
+evalAr :: C -> Value -> Exp -> Env -> Addr -> [Either Error C]
 evalAr c@(_,p,s,_,t) (Closure x body) e p' a = do
     let k = Fn (x, body) p a
-    let (a',s') = allocK k c
-    return (Right e, p', s', a', tick c)
-evalAr _ v _ _ _ = typeError Function v
+    (a',s') <- allocK k c
+    t' <- tick c
+    lreturn (Right e, p', s', a', t')
+evalAr _ v _ _ _ = lTypeError Function v
 
-evalFn :: C -> Value -> (String,Exp) -> Env -> Addr -> Either Error C
-evalFn c@(_,_,s,_,t) v (x,body) p a = do
-    let (p',s') = allocV x v p c
-    return (Right body, p', s', a, tick c)
+evalFn :: C -> Value -> (String,Exp) -> Env -> Addr -> [Either Error C]
+evalFn c@(_,_,s,_,_) v (x,body) p a = do
+    (p',s') <- allocV x v p c
+    t' <- tick c
+    lreturn (Right body, p', s', a, t')
 
-evalIf :: C -> Value -> Exp -> Exp -> Env -> Addr -> Either Error C
+evalIf :: C -> Value -> Exp -> Exp -> Env -> Addr -> [Either Error C]
 evalIf c@(_,_,s,_,_) (VB b) e_true e_false p a = do 
-    return (Right $ if b then e_true else e_false, p, s, a, tick c)
-evalIf c v e_true e_false p a = typeError Boolean v
+    t' <- tick c
+    lreturn (Right $ if b then e_true else e_false, p, s, a, t')
+evalIf c v e_true e_false p a = lTypeError Boolean v
 
-evalOp2A :: C -> Value -> Op -> Exp -> Env -> Addr -> Either Error C
+evalOp2A :: C -> Value -> Op -> Exp -> Env -> Addr -> [Either Error C]
 evalOp2A c@(_,_,s,_,_) (VI n) o e p a = do 
     let k = Op2_b o n p a
-    let (a',s') = allocK k c
-    return (Right e, p, s', a', tick c)
-evalOp2A c@(_,_,s,_,_) v o e p a = typeError Number v
+    (a',s') <- allocK k c
+    t' <- tick c
+    lreturn (Right e, p, s', a', t')
+evalOp2A c@(_,_,s,_,_) v o e p a = lTypeError Number v
 
-evalOp2B :: C -> Value -> Op -> Int -> Env -> Addr -> Either Error C
+evalOp2B :: C -> Value -> Op -> Int -> Env -> Addr -> [Either Error C]
 evalOp2B c@(_,_,s,_,_) (VI n') o n p a = do
     r <- evalOp o n n'
-    let v = Left r
-    return (v, p, s, a, tick c)
-evalOp2B c v o n p a = typeError Number v
+    case r of
+        Left e -> [Left e]
+        Right r' -> do
+            let v = Left r'
+            t' <- tick c
+            lreturn (v, p, s, a, t')
+evalOp2B c v o n p a = lTypeError Number v
 
 
-evalOp :: Op -> Int -> Int -> Either Error Value 
+evalOp :: Op -> Int -> Int -> [Either Error Value]
 evalOp Add = injectF (+) VI
 evalOp Sub = injectF (-) VI
 evalOp Mult = injectF (*) VI
 evalOp Eq = injectF (==) VB
-evalOp Div = \x y -> if y == 0 then Left DivByZero else Right $ VI $ x `div` y
+evalOp Div = \x y -> return $ if y == 0 then Left DivByZero else Right $ VI $ x `div` y
 
-evalRecBind :: C -> Value -> String -> Addr -> Either Error C
+evalRecBind :: C -> Value -> String -> Addr -> [Either Error C]
 evalRecBind c@(_,p,s,_,t) v name a = do
-    let (p',s') = allocV name v p c 
-    return (Left v,p',s',a, tick c)
+    (p',s') <- allocV name v p c 
+    t' <- tick c
+    lreturn (Left v,p',s',a, t')
 
-injectF :: forall a. (Int -> Int -> a) -> (a -> Value) -> Int -> Int -> Either Error Value
-injectF f pack x y = Right $ pack  $ f x y
+injectF :: forall a. (Int -> Int -> a) -> (a -> Value) -> Int -> Int -> [Either Error Value]
+injectF f pack x y = [Right $ pack  $ f x y]
